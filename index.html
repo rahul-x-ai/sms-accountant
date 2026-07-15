@@ -2837,8 +2837,8 @@ document.addEventListener('click', e => {
 // Replace SUPABASE_URL and SUPABASE_ANON_KEY with your values
 // when you have them from supabase.com → Settings → API
 // ═══════════════════════════════════════════════════════════
-const SUPABASE_URL = ''; // e.g. 'https://xxxx.supabase.co'
-const SUPABASE_ANON_KEY = ''; // eyJ... key from Supabase Settings > API
+const SUPABASE_URL = 'https://kwmaddjxvrjnlewustdo.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt3bWFkZGp4dnJqbmxld3VzdGRvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1MjY1NzYsImV4cCI6MjA5OTEwMjU3Nn0.kN7i73pAniUnP1BeVoHEB59ItVaZkIl9K3v3YuKkT4M';
 const SUPABASE_TABLE = 'user_data';
 
 let supabaseSession = null; // stores { user_id, access_token }
@@ -2962,10 +2962,47 @@ function openSettings() {
   document.getElementById('panel-overlay').classList.add('open');
 }
 
-// Restore session on load
-window.addEventListener('load', ()=>{
+// Restore session on load — auto-sync from Supabase if session exists
+window.addEventListener('load', async ()=>{
   const saved = LS.get('sb_session');
-  if (saved?.access_token) supabaseSession = saved;
+  if (saved?.access_token) {
+    supabaseSession = saved;
+    updateSyncStatus('↓ Syncing…', 'var(--text2)');
+    try {
+      const loaded = await supabaseLoad();
+      if (loaded) {
+        allTxns = getAllTxns();
+        matchDueStatuses(allTxns);
+        allTxns = getAllTxns();
+        populateFilters(); buildMonthNav(); renderAll();
+        // Show app if data loaded from cloud
+        if (Object.keys(smsStore).length > 0) {
+          document.getElementById('upload-screen').style.display='none';
+          document.getElementById('app-screen').style.display='flex';
+          document.getElementById('fab-btn').style.display='flex';
+          document.getElementById('hdr-meta').innerHTML=`<b>${allTxns.length}</b> messages · synced from cloud`;
+        }
+        updateSyncStatus('✓ Synced', 'var(--green)');
+      } else {
+        updateSyncStatus('☁ Connected', 'var(--text2)');
+      }
+    } catch(e) {
+      updateSyncStatus('⚠ Sync failed', 'var(--amber)');
+    }
+  }
+
+  // Also restore from localStorage if no cloud session
+  const stored = Object.keys(smsStore).length;
+  if (stored > 0 && document.getElementById('app-screen').style.display !== 'flex') {
+    allTxns=getAllTxns();
+    matchDueStatuses(allTxns);
+    allTxns=getAllTxns();
+    populateFilters(); buildMonthNav(); renderAll();
+    document.getElementById('upload-screen').style.display='none';
+    document.getElementById('app-screen').style.display='flex';
+    document.getElementById('fab-btn').style.display='flex';
+    document.getElementById('hdr-meta').innerHTML=`<b>${allTxns.length}</b> messages · restored from memory`;
+  }
 });
 
 function exportData() {
