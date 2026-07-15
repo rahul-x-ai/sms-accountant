@@ -2895,16 +2895,31 @@ async function supabaseSave() {
   if (!SUPABASE_URL || !supabaseSession) return;
   try {
     const typeRules = LS.get('type_rules')||{};
-    const payload = { user_id: supabaseSession.user_id, data: {smsStore, merchantMap, overrideStore, manualStore, typeRules}, updated_at: new Date().toISOString() };
-    // Upsert — insert or update
-    await supabaseRequest(
-      `${SUPABASE_TABLE}?user_id=eq.${supabaseSession.user_id}`,
-      'PATCH', payload, supabaseSession.access_token
-    ).catch(async ()=>{
-      await supabaseRequest(SUPABASE_TABLE, 'POST', payload, supabaseSession.access_token);
+    const payload = {
+      user_id: supabaseSession.user_id,
+      data: {smsStore, merchantMap, overrideStore, manualStore, typeRules},
+      updated_at: new Date().toISOString()
+    };
+    // Use upsert via POST with Prefer: resolution=merge-duplicates
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${supabaseSession.access_token}`,
+        'Prefer': 'resolution=merge-duplicates,return=minimal',
+      },
+      body: JSON.stringify(payload)
     });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(err);
+    }
     updateSyncStatus('✓ Synced', 'var(--green)');
-  } catch(e) { updateSyncStatus('⚠ Sync failed', 'var(--amber)'); console.warn('Supabase save:', e.message); }
+  } catch(e) {
+    updateSyncStatus('⚠ Sync failed', 'var(--amber)');
+    console.warn('Supabase save:', e.message);
+  }
 }
 
 function updateSyncStatus(msg, col) {
