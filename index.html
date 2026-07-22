@@ -100,6 +100,7 @@ self.addEventListener('fetch', e => {
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SMS Accountant</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%235b8dee'/%3E%3Cstop offset='1' stop-color='%238b5cf6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle'%3E%F0%9F%92%AC%3C/text%3E%3C/svg%3E">
 <!--
 ================================================================================
 HANDOFF CONTEXT — SMS Financial Tracker v4.0
@@ -232,6 +233,11 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14
 .hbtn{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:5px 10px;color:var(--text2);font-size:11px;cursor:pointer;white-space:nowrap;transition:var(--tr);}
 .hbtn:hover{color:var(--text);}
 .hbtn.warn{color:var(--amber);}
+.hbtn:disabled{opacity:.5;cursor:not-allowed;}
+.sync-spinner{display:inline-block;width:10px;height:10px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:sync-spin .7s linear infinite;margin-right:5px;vertical-align:-1px;}
+@keyframes sync-spin{to{transform:rotate(360deg);}}
+.load-more-btn{display:block;width:100%;padding:11px;margin-top:8px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text2);font-size:12px;font-weight:600;cursor:pointer;}
+.load-more-btn:hover{color:var(--text);border-color:var(--accent);}
 
 /* UPLOAD */
 #upload-screen{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px;overflow-y:auto;}
@@ -385,6 +391,7 @@ select.fil,select.sort-sel{background:var(--surface);border:1px solid var(--bord
 .due-status.paid{background:rgba(56,189,248,.12);color:var(--blue);}
 .due-status.acknowledged{background:rgba(34,199,122,.12);color:var(--green);}
 .due-status.flagged{background:rgba(239,68,68,.12);color:var(--red);}
+.due-status.rolled-over{background:rgba(139,92,246,.12);color:#8b5cf6;}
 
 /* SUBHEADER */
 .sub-hdr{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text2);margin:14px 0 7px;padding:5px 9px;background:var(--surface2);border-radius:6px;border-left:3px solid var(--accent);}
@@ -398,6 +405,7 @@ select.fil,select.sort-sel{background:var(--surface);border:1px solid var(--bord
 .due-item.soon{border-color:rgba(245,158,11,.35);}
 .due-item.paid-border{border-color:rgba(56,189,248,.3);}
 .due-item.ack-border{border-color:rgba(34,199,122,.3);}
+.due-item.rolled-border{border-color:rgba(139,92,246,.3);}
 .due-hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;}
 .due-sender{font-size:13px;font-weight:700;}
 .due-amt{font-size:14px;font-weight:700;font-family:var(--mono);color:var(--amber);}
@@ -819,16 +827,19 @@ let smsStore      = LS.get('sms_store')      || {};
 let merchantMap   = LS.get('merchant_map')   || {};
 let overrideStore = LS.get('override_store') || {};
 let manualStore   = LS.get('manual_store')   || {};  // manually entered transactions
+let syncDirty     = false; // set true on any local change; cleared after a successful push
 
 function saveAll() {
   LS.set('sms_store', smsStore);
   LS.set('merchant_map', merchantMap);
   LS.set('override_store', overrideStore);
   LS.set('manual_store', manualStore);
-  // Auto-sync to Supabase if session active
+  LS.set('last_local_change_at', new Date().toISOString());
+  // Sync no longer fires per-change (was 800ms debounce) — a 30s interval timer
+  // (started on login / session restore) handles periodic push instead. We just
+  // mark data as dirty here so that timer knows there's something to push.
   if (typeof supabaseSession !== 'undefined' && supabaseSession) {
-    clearTimeout(saveAll._sbTimer);
-    saveAll._sbTimer = setTimeout(supabaseSave, 800);
+    syncDirty = true;
   }
 }
 
@@ -1337,151 +1348,12 @@ function dedupeDues(dues) {
   return originals;
 }
 
-function matchDueStatuses(txns) {
-  const allDues = txns.filter(t=>t.type==='due');
-  const dues    = dedupeDues(allDues); // only originals are processed/counted
-  const payments= txns.filter(t=>t.type==='payment'||t.type==='transfer');
-  const debits  = txns.filter(t=>t.type==='debit');
-  const allPay  = [...payments,...debits];
+// Auto-matching removed: due status (paid/acknowledged/rolled-over) is now set
+// entirely manually via advanceDueStatus()/confirmDueAmount() below, triggered by
+// tapping the due status badge. This function is kept as a no-op so the existing
+// call sites (after parse/reclassify/pull) don't need to be touched individually.
+function matchDueStatuses(txns) { /* intentionally no-op — see comment above */ }
 
-  // Global pool of messages already consumed by an earlier (chronologically prior) due —
-  // each payment/ack SMS can only resolve ONE due, first match wins and locks it.
-  const consumedFps = new Set();
-
-  // Process dues in due-date order (earliest bill first) so the earliest, most likely
-  // candidate gets first claim on a payment/ack message.
-  const sortedDues = [...dues].sort((a,b)=>{
-    const da = parseDueDate(a.dueDate)||a.date||0;
-    const db = parseDueDate(b.dueDate)||b.date||0;
-    return da-db;
-  });
-
-  sortedDues.forEach(due => {
-    const ov = overrideStore[due.fp];
-    if (ov?.dueStatus && ov?.manualOverride) return; // manual override wins
-
-    const dueAmt = due.amount||0;
-    const dueDateParsed = parseDueDate(due.dueDate) || due.date || new Date(0);
-    const smsDate = due.date || new Date(0);
-    const cardEnd = canonicalCard(due.acct, due.bank);
-    const sewaAcct = extractSEWAAccount(due.body);
-    const isSEWA = due.bank==='SEWA';
-
-    // Scoring happens in scoreCandidateShared() below — replaces the old exclusive-lock
-    // scorer so SEWA arrears bills can share one combined payment SMS.
-
-    // SEWA carries arrears forward: one payment SMS can settle the current bill
-    // AND the immediately preceding unpaid bill on the same account in a single
-    // payment. For SEWA, allow an already-consumed payment to be reused as a
-    // shared-settlement match (not exclusively locked) so both bills resolve.
-    const allowSharedReuse = isSEWA;
-
-    function scoreCandidateShared(p, requireAckWording) {
-      if (!allowSharedReuse && consumedFps.has(p.fp)) return null;
-      if (!p.date) return null;
-      if (p.date < smsDate) return null;
-      const daysAfterDueDate = (p.date - dueDateParsed) / 86400000;
-      if (daysAfterDueDate < -15 || daysAfterDueDate > 45) return null;
-      const pAmt = p.amount||0;
-      // Broadened ack wording: catches EI "confirm receipt", SIB "credited to your card account", ADIB "has been credited"
-      if (requireAckWording && !/credited|received|processed|confirmed|confirm\s+receipt|receipt\s+of\s+your\s+payment/i.test(p.body)) return null;
-      if (isSEWA) {
-        const sewaMatch = (sewaAcct && (p.body||'').includes(sewaAcct)) ||
-                          /shj\s+elec\s+water|sewa/i.test(p.body||'') ||
-                          /shj\s+elec\s+water|sewa/i.test(p.merchant||'');
-        if (!sewaMatch || pAmt<=0) return null;
-      } else {
-        // Resolve both due's card and payment's card to canonical form before comparing
-        // cardEnd is already canonical (resolved in matchDueStatuses setup)
-        // Resolve payment card to canonical too, then compare
-        const payCardCanon = canonicalCard(p.acct, p.bank);
-        const cardMatches = cardEnd && (
-          payCardCanon === cardEnd ||
-          (p.body||'').includes(cardEnd) ||
-          (p.body||'').includes(cardEnd.slice(-4))
-        );
-        if (!cardMatches) return null;
-      }
-      const amountDiff = Math.abs(pAmt - dueAmt);
-      const amountScore = Math.min(amountDiff, 200);
-      const dateScore = Math.abs(daysAfterDueDate) * 3;
-      return amountScore + dateScore;
-    }
-
-    // Find best payment-type candidate (transfer/debit moving money toward the bill)
-    let matchedPay=null, bestPayScore=Infinity;
-    for (const p of allPay) {
-      const s = scoreCandidateShared(p, false);
-      if (s!==null && s<bestPayScore) { bestPayScore=s; matchedPay=p; }
-    }
-
-    // Find best acknowledgement candidate independently (bank confirming receipt)
-    let matchedAck=null, bestAckScore=Infinity;
-    for (const p of payments) {
-      const s = scoreCandidateShared(p, true);
-      if (s!==null && s<bestAckScore) { bestAckScore=s; matchedAck=p; }
-    }
-    // Don't let the same SMS serve as both payment and acknowledgement
-    if (matchedAck && matchedPay && matchedAck.fp===matchedPay.fp) {
-      matchedPay = null; bestPayScore = Infinity;
-      for (const p of allPay) {
-        if (p.fp===matchedAck.fp) continue;
-        const s = scoreCandidateShared(p, false);
-        if (s!==null && s<bestPayScore) { bestPayScore=s; matchedPay=p; }
-      }
-    }
-
-    // Assign status — preserve any existing manual type override
-    if (!overrideStore[due.fp]) overrideStore[due.fp]={};
-    const preservedType = overrideStore[due.fp].type; // keep manual type reclassification
-    const linkedMsgs = [];
-    if (matchedPay) { linkedMsgs.push({fp:matchedPay.fp, role:'payment'}); consumedFps.add(matchedPay.fp); }
-
-    if (matchedAck) {
-      const ackAmt = matchedAck.amount||0;
-      linkedMsgs.push({fp:matchedAck.fp, role:'acknowledgement'});
-      consumedFps.add(matchedAck.fp);
-      if (ackAmt < dueAmt-1) {
-        overrideStore[due.fp].dueStatus='flagged';
-        overrideStore[due.fp].flagReason='partial';
-      } else {
-        overrideStore[due.fp].dueStatus='acknowledged';
-      }
-      overrideStore[due.fp].paidAmt=ackAmt;
-    } else if (matchedPay) {
-      const pAmt=matchedPay.amount||0;
-      if (pAmt>=dueAmt-1) {
-        overrideStore[due.fp].dueStatus='paid';
-      } else {
-        overrideStore[due.fp].dueStatus='flagged';
-        overrideStore[due.fp].flagReason='partial';
-      }
-      overrideStore[due.fp].paidAmt=pAmt;
-    } else {
-      delete overrideStore[due.fp].dueStatus;
-      delete overrideStore[due.fp].flagReason;
-    }
-    overrideStore[due.fp].linkedMsgs = linkedMsgs;
-    overrideStore[due.fp].reminderFps = (due.linkedReminders||[]).map(r=>r.fp);
-    if (preservedType) overrideStore[due.fp].type = preservedType; // restore manual override
-
-    // SEWA: arrears rollover — if this bill is settled (paid or acknowledged) via a
-    // combined payment, the immediately preceding unpaid SEWA bill on the same
-    // account was folded into this same payment and should also be marked settled,
-    // referencing the same linked SMS.
-    if (isSEWA && (matchedPay || matchedAck) && sewaAcct) {
-      sortedDues.filter(d2=>d2!==due&&d2.bank==='SEWA'&&extractSEWAAccount(d2.body)===sewaAcct&&d2.date<due.date).forEach(d2=>{
-        if (!overrideStore[d2.fp]) overrideStore[d2.fp]={};
-        if (!overrideStore[d2.fp].dueStatus || overrideStore[d2.fp].dueStatus==='due') {
-          overrideStore[d2.fp].dueStatus = matchedAck ? 'acknowledged' : 'paid';
-          overrideStore[d2.fp].linkedMsgs = linkedMsgs;
-          overrideStore[d2.fp].arrearsRollover = true;
-        }
-      });
-    }
-  });
-  saveAll();
-}
 
 // ═══════════════════════════════════════════════════════════
 // XML PARSER + INCREMENTAL IMPORT
@@ -1536,7 +1408,7 @@ function getAllTxns() {
     const ov=overrideStore[t.fp]||{};
     return {
       ...t, type:ov.type||t.type, dueStatus:ov.dueStatus||null, paidAmt:ov.paidAmt||null,
-      flagReason:ov.flagReason||null, linkedMsgs:ov.linkedMsgs||[], reminderFps:ov.reminderFps||[],
+      ackAmt:ov.ackAmt||null, flagReason:ov.flagReason||null, linkedMsgs:ov.linkedMsgs||[], reminderFps:ov.reminderFps||[],
       isReminderDuplicate: t.type==='due' && reminderFpSet.has(t.fp),
     };
   });
@@ -1623,10 +1495,16 @@ function typeBadgeHtml(t) {
   return `<span class="type-bdg" onclick="event.stopPropagation();setTimeout(()=>openTypeReclassify('${t.fp}'),50)">${TYPE_PILL_LABELS[t.type]||t.type} <i style="font-size:9px">▾</i></span>`;
 }
 
+function isPartialDue(t) {
+  return (t.dueStatus==='paid'||t.dueStatus==='acknowledged') && t.flagReason==='partial';
+}
+
 function dueStatusHtml(t) {
   const status=t.dueStatus||'due';
-  const labels={due:'⏳ Due',paid:'💳 Paid',acknowledged:'✅ Acknowledged',flagged:t.flagReason==='partial'?'⚠ Partial payment':'⚠ Underpaid'};
-  return `<span class="due-status ${status}" onclick="event.stopPropagation();cycleDueStatus('${t.fp}')">${labels[status]||status}</span>`;
+  const partial=isPartialDue(t);
+  const labels={due:'⏳ Due','rolled-over':'↩️ Rolled Over',paid:partial?'⚠ Partial (Paid)':'💳 Paid',acknowledged:partial?'⚠ Partial (Acked)':'✅ Acknowledged'};
+  const cls = partial ? 'flagged' : status;
+  return `<span class="due-status ${cls}" onclick="event.stopPropagation();advanceDueStatus('${t.fp}')">${labels[status]||status}</span>`;
 }
 
 function getCatIcon(t) {
@@ -1821,7 +1699,8 @@ function confirmDeleteManual(fp) {
 function renderDueItem(t) {
   const days=daysUntil(t);
   const status=t.dueStatus||'due';
-  const borderCls=status==='acknowledged'?'ack-border':status==='paid'?'paid-border':status==='flagged'?'overdue':days!==null&&days<0?'overdue':days!==null&&days<=5?'soon':'';
+  const partial=isPartialDue(t);
+  const borderCls=partial?'overdue':status==='acknowledged'?'ack-border':status==='paid'?'paid-border':status==='rolled-over'?'rolled-border':days!==null&&days<0?'overdue':days!==null&&days<=5?'soon':'';
   const reminderCount=(t.reminderFps||[]).length;
   return `<div class="due-item ${borderCls}" onclick="showModal('${t.fp}')">
     <div class="due-hdr">
@@ -1831,7 +1710,7 @@ function renderDueItem(t) {
     <div class="due-desc">${t.body.substring(0,110)}${t.body.length>110?'…':''}</div>
     <div class="due-ftr">
       ${dueStatusHtml(t)}
-      ${status==='flagged'&&t.flagReason==='partial'?`<span class="flag-msg">⚠ Partial payment — less than due amount</span>`:status==='flagged'?`<span class="flag-msg">⚠ Payment less than due!</span>`:''}
+      ${partial?`<span class="flag-msg">⚠ Partial payment — less than due amount</span>`:''}
       <div class="due-sms-date">${t.dateStr}${t.dueDate?` · Due: ${t.dueDate}`:''}</div>
     </div>
   </div>`;
@@ -1953,9 +1832,40 @@ function statCard(lbl,val,sub,cc,onclick) {
 function emptyHtml(icon,title,msg) { return `<div class="empty"><div class="empty-icon">${icon}</div><h3>${title}</h3><p>${msg}</p></div>`; }
 
 // ═══════════════════════════════════════════════════════════
+// PERFORMANCE: only the visible tab's heavy list gets built into
+// the DOM, and long lists page in batches instead of dumping
+// everything at once. Rendering all ~21k messages' worth of rows
+// across every tab on every renderAll() call was freezing/crashing
+// mobile Chrome — this caps the work to what's actually on screen.
+// ═══════════════════════════════════════════════════════════
+const LIST_PAGE_SIZE = 150;
+let listPageState = {}; // tabKey -> how many items currently shown
+let lastGroups = null;  // cached filtered groups from the last renderAll(), reused on tab switch
+
+function renderListPaginated(containerId, items, renderFn, emptyIcon, emptyTitle, emptySub, tabKey, useCurrencySplit) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  if (!items.length) { container.innerHTML = emptyHtml(emptyIcon, emptyTitle, emptySub); return; }
+  const shown = Math.min(listPageState[tabKey] || LIST_PAGE_SIZE, items.length);
+  const visible = items.slice(0, shown);
+  let html = useCurrencySplit ? renderWithCurrencySplit(visible, renderFn) : visible.map(renderFn).join('');
+  const remaining = items.length - shown;
+  if (remaining > 0) {
+    html += `<button class="load-more-btn" onclick="loadMoreList('${tabKey}')">Load more (${Math.min(LIST_PAGE_SIZE,remaining)} of ${remaining} remaining)</button>`;
+  }
+  container.innerHTML = html;
+}
+
+function loadMoreList(tabKey) {
+  listPageState[tabKey] = (listPageState[tabKey] || LIST_PAGE_SIZE) + LIST_PAGE_SIZE;
+  renderActiveTabList();
+}
+
+// ═══════════════════════════════════════════════════════════
 // RENDER ALL
 // ═══════════════════════════════════════════════════════════
 function renderAll() {
+  listPageState = {}; // fresh filter/data pass — old pagination offsets no longer apply
   const fil=applyFilters(allTxns);
   const debits=fil.filter(t=>t.type==='debit');
   const credits=fil.filter(t=>t.type==='credit');
@@ -1978,7 +1888,7 @@ function renderAll() {
   document.getElementById('bdg-transfers').textContent=transfers.length;
   document.getElementById('bdg-dues').textContent=dues.length;
   document.getElementById('bdg-others').textContent=others.length;
-  const acksCount=dues.filter(t=>t.dueStatus==='acknowledged'||t.dueStatus==='flagged').length;
+  const acksCount=dues.filter(t=>t.dueStatus==='acknowledged'||isPartialDue(t)).length;
   document.getElementById('bdg-acks').textContent=acksCount;
 
   // Uncategorised count
@@ -1991,7 +1901,10 @@ function renderAll() {
   document.getElementById('review-banner-wrap').innerHTML=uncatCount>0?`
     <div class="review-banner">
       <div><div class="review-banner-txt">🏷 ${uncatCount} Uncategorised Merchant${uncatCount>1?'s':''}</div><div class="review-banner-sub">Tap a category badge on any spend to classify it</div></div>
-      <button class="review-btn" onclick="switchTab('spends');document.getElementById('cat-filter').value='Uncategorised';catFil='Uncategorised';renderAll()">Review Now</button>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="review-btn" style="background:var(--surface2);color:var(--text)" onclick="exportUncategorisedMerchants()">⬇ Export</button>
+        <button class="review-btn" onclick="switchTab('spends');document.getElementById('cat-filter').value='Uncategorised';catFil='Uncategorised';renderAll()">Review Now</button>
+      </div>
     </div>`:'';
 
   document.getElementById('stat-grid').innerHTML=
@@ -2038,8 +1951,11 @@ function renderAll() {
   document.getElementById('transfers-list').innerHTML=transfersShown.length?renderWithCurrencySplit(transfersShown,renderTxnItem):emptyHtml('↔️','No results','Try a different sub-filter.');
 
   // ── DUES ──
-  const pendingDues=dues.filter(t=>!t.dueStatus||t.dueStatus==='due'||t.dueStatus==='flagged');
-  const paidDues=dues.filter(t=>t.dueStatus==='paid'||t.dueStatus==='acknowledged');
+  // Pending = still 'due', or paid/acknowledged but flagged partial (not fully settled).
+  // Resolved = fully paid/acknowledged (non-partial), or rolled-over into a later bill.
+  const isPendingDue = t => { const st=t.dueStatus||'due'; return st==='due' || isPartialDue(t); };
+  const pendingDues=dues.filter(isPendingDue);
+  const paidDues=dues.filter(t=>!isPendingDue(t));
   const totalPending=pendingDues.filter(t=>t.currency==='AED').reduce((s,t)=>s+(t.amount||0),0);
   const totalPaid=paidDues.filter(t=>t.currency==='AED').reduce((s,t)=>s+(t.amount||0),0);
   const overdueCnt2=pendingDues.filter(t=>{const d=daysUntil(t);return d!==null&&d<0;}).length;
@@ -2087,22 +2003,50 @@ function renderAll() {
 
   // Sort dues: pending first, then settled
   const sortedDues=[...pendingDues,...paidDues];
-  document.getElementById('dues-list').innerHTML=sortedDues.length?sortedDues.map(renderDueItem).join(''):emptyHtml('🔔','No dues','No payment due notices found.');
 
   // ── ACKNOWLEDGEMENTS (manual review) ──
-  const ackedDues=dues.filter(t=>t.dueStatus==='acknowledged');
-  const flaggedDues=dues.filter(t=>t.dueStatus==='flagged');
+  const ackedDues=dues.filter(t=>t.dueStatus==='acknowledged'&&!isPartialDue(t));
+  const flaggedDues=dues.filter(isPartialDue);
   document.getElementById('acks-stats').innerHTML=
-    statCard('Acknowledged',`${ackedDues.length}`,'auto-matched by bank confirmation','c-green')+
+    statCard('Acknowledged',`${ackedDues.length}`,'confirmed as fully settled','c-green')+
     statCard('Flagged',`${flaggedDues.length}`,'partial or underpaid — review','c-amber');
-  document.getElementById('acks-list-ack').innerHTML=ackedDues.length?ackedDues.map(renderDueItem).join(''):emptyHtml('✅','Nothing here','Acknowledged dues will appear here for review.');
-  document.getElementById('acks-list-flag').innerHTML=flaggedDues.length?flaggedDues.map(renderDueItem).join(''):emptyHtml('⚠','Nothing flagged','Underpaid or partial dues will appear here.');
 
-  // ── OTHERS ──
-  document.getElementById('others-list').innerHTML=others.length?others.map(renderTxnItem).join(''):emptyHtml('📋','No others','Promotions and info messages appear here.');
+  // Cache filtered groups so switchTab() can render the newly-visible tab without
+  // recomputing filters, then build the heavy per-row HTML for ONLY the active tab.
+  // Rendering all six lists (some with thousands of rows) on every single render —
+  // regardless of which tab was actually visible — is what was freezing mobile Chrome.
+  lastGroups = {debits,credits,transfersShown,sortedDues,ackedDues,flaggedDues,others};
+  renderActiveTabList();
+}
 
-  // ── DEBUG ──
-  renderDebug();
+function renderActiveTabList() {
+  if (!lastGroups) return;
+  const {debits,credits,transfersShown,sortedDues,ackedDues,flaggedDues,others} = lastGroups;
+  switch (currentTab) {
+    case 'spends':
+      renderListPaginated('spends-list', debits, renderTxnItem, '💸','No spends','No debit transactions in this range.','spends', true);
+      break;
+    case 'credits':
+      renderListPaginated('credits-list', credits, renderTxnItem, '💰','No credits','Salary, interest, dividends appear here.','credits', true);
+      break;
+    case 'transfers':
+      renderListPaginated('transfers-list', transfersShown, renderTxnItem, '↔️','No results','Try a different sub-filter.','transfers', true);
+      break;
+    case 'dues':
+      renderListPaginated('dues-list', sortedDues, renderDueItem, '🔔','No dues','No payment due notices found.','dues', false);
+      break;
+    case 'acks':
+      renderListPaginated('acks-list-ack', ackedDues, renderDueItem, '✅','Nothing here','Acknowledged dues will appear here for review.','acks-ack', false);
+      renderListPaginated('acks-list-flag', flaggedDues, renderDueItem, '⚠','Nothing flagged','Underpaid or partial dues will appear here.','acks-flag', false);
+      break;
+    case 'others':
+      renderListPaginated('others-list', others, renderTxnItem, '📋','No others','Promotions and info messages appear here.','others', false);
+      break;
+    case 'debug':
+      renderDebug();
+      break;
+    // dashboard's recent-list is already built unconditionally in renderAll (capped at 10, cheap)
+  }
 }
 
 function setTransferSubfil(v) {
@@ -2145,7 +2089,9 @@ function renderDebug() {
   });
   const tbody=document.getElementById('debug-tbody');
   if(!tbody) return;
-  tbody.innerHTML=rows.map((t,i)=>`<tr style="cursor:pointer${isPossiblyMissed(t)?';background:rgba(245,158,11,.08)':''}" onclick="showDebugModal('${t.fp}')">
+  const shown = Math.min(listPageState['debug'] || LIST_PAGE_SIZE, rows.length);
+  const visible = rows.slice(0, shown);
+  let html = visible.map((t,i)=>`<tr style="cursor:pointer${isPossiblyMissed(t)?';background:rgba(245,158,11,.08)':''}" onclick="showDebugModal('${t.fp}')">
     <td style="color:var(--text3)">${i+1}</td>
     <td style="font-size:10px;white-space:nowrap;color:var(--text2)">${t.dateStr||'—'}</td>
     <td style="font-family:var(--mono);font-size:10px">${t.address}</td>
@@ -2155,6 +2101,11 @@ function renderDebug() {
     <td style="font-size:10px;color:var(--text3)">${t.rule||'—'}</td>
     <td style="font-size:11px;color:var(--text2)">${t.body.substring(0,65)}${t.body.length>65?'…':''}</td>
   </tr>`).join('');
+  const remaining = rows.length - shown;
+  if (remaining > 0) {
+    html += `<tr><td colspan="8" style="text-align:center;padding:10px"><button class="load-more-btn" style="width:auto;padding:7px 16px" onclick="loadMoreList('debug')">Load more (${Math.min(LIST_PAGE_SIZE,remaining)} of ${remaining} remaining)</button></td></tr>`;
+  }
+  tbody.innerHTML = html;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2209,7 +2160,6 @@ function showModal(fp) {
 
 function showDueModal(t) {
   const reminders=(t.reminderFps||[]).map(fp=>allTxns.find(x=>x.fp===fp)).filter(Boolean).sort((a,b)=>(a.date||0)-(b.date||0));
-  const linked=(t.linkedMsgs||[]).map(lm=>({...allTxns.find(x=>x.fp===lm.fp),role:lm.role})).filter(x=>x.fp);
 
   let html=`<div class="due-timeline-lbl">Original due notice</div>
     <div class="due-timeline-card">
@@ -2225,22 +2175,23 @@ function showDueModal(t) {
       </div>`;
   });
 
-  linked.forEach(lm=>{
-    const isAck=lm.role==='acknowledgement';
-    const status=t.dueStatus;
-    let tagText = isAck ? (status==='flagged'?'partial payment':'acknowledged') : 'payment initiated';
-    let tagClass = status==='flagged' ? 'warn' : isAck ? 'ok' : 'info';
-    html+=`<div class="due-timeline-lbl">${isAck?'Acknowledgement':'Payment'}</div>
-      <div class="due-timeline-card ${tagClass}">
-        <div class="due-timeline-body">${lm.body}</div>
-        <div class="due-timeline-ftr"><span>${lm.dateStr}</span><span class="due-timeline-tag ${tagClass}">${tagText}</span></div>
-      </div>`;
-  });
-
-  if (!linked.length) {
+  const partial = isPartialDue(t);
+  if (t.dueStatus==='rolled-over') {
     html+=`<div class="due-timeline-lbl">Status</div>
       <div class="due-timeline-card">
-        <div style="font-size:12px;color:var(--text2)">No payment or acknowledgement matched yet. Still showing as Due.</div>
+        <div style="font-size:12px;color:var(--text2)">Rolled over — settled together with a later bill.</div>
+      </div>`;
+  } else if (t.dueStatus==='paid' || t.dueStatus==='acknowledged') {
+    const amt = t.dueStatus==='acknowledged' ? t.ackAmt : t.paidAmt;
+    html+=`<div class="due-timeline-lbl">${t.dueStatus==='acknowledged'?'Acknowledged amount':'Paid amount'}</div>
+      <div class="due-timeline-card ${partial?'warn':'ok'}">
+        <div style="font-size:13px;font-weight:700">${fmtAmt({amount:amt,currency:t.currency})}</div>
+        ${partial?'<div style="font-size:11px;color:var(--red);margin-top:4px">⚠ Less than due amount</div>':''}
+      </div>`;
+  } else {
+    html+=`<div class="due-timeline-lbl">Status</div>
+      <div class="due-timeline-card">
+        <div style="font-size:12px;color:var(--text2)">Still due — tap the status badge above to record a payment.</div>
       </div>`;
   }
 
@@ -2549,16 +2500,85 @@ function applyTypeReclassify(applyToAll) {
 
 
 // ═══════════════════════════════════════════════════════════
-// DUE STATUS CYCLING
+// DUE STATUS — fully manual now (see matchDueStatuses stub above).
+// Cycle: due → paid → acknowledged → due (destructive reset, confirmed)
+// SEWA:  due → rolled-over → paid → acknowledged → due
 // ═══════════════════════════════════════════════════════════
-function cycleDueStatus(fp) {
+function advanceDueStatus(fp) {
   const t=allTxns.find(x=>x.fp===fp); if(!t) return;
-  const cycle=['due','paid','acknowledged'];
-  const cur=t.dueStatus||'due';
-  const next=cycle[(cycle.indexOf(cur)+1)%cycle.length];
-  if(!overrideStore[fp]) overrideStore[fp]={};
-  overrideStore[fp].dueStatus=next;
-  saveAll(); allTxns=getAllTxns(); renderAll();
+  const isSEWA = t.bank==='SEWA';
+  const cur = t.dueStatus||'due';
+  const cycle = isSEWA ? ['due','rolled-over','paid','acknowledged'] : ['due','paid','acknowledged'];
+  const idx = cycle.indexOf(cur);
+  // If a due somehow has a status not in this bank's cycle (e.g. stale data), fall back to 'due'.
+  const next = idx===-1 ? cycle[0] : cycle[(idx+1)%cycle.length];
+
+  if (next==='due') {
+    if (!confirm('Reset this bill back to Due? This clears the recorded paid/acknowledged amount.')) return;
+    if (!overrideStore[fp]) overrideStore[fp]={};
+    delete overrideStore[fp].dueStatus;
+    delete overrideStore[fp].paidAmt;
+    delete overrideStore[fp].ackAmt;
+    delete overrideStore[fp].flagReason;
+    saveAll(); allTxns=getAllTxns(); renderAll();
+    return;
+  }
+  if (next==='rolled-over') {
+    if (!confirm('Mark this bill as rolled over into the next bill? It will be removed from your outstanding Due list.')) return;
+    if (!overrideStore[fp]) overrideStore[fp]={};
+    overrideStore[fp].dueStatus='rolled-over';
+    saveAll(); allTxns=getAllTxns(); renderAll();
+    return;
+  }
+  // next is 'paid' or 'acknowledged' — ask for the amount
+  openDueAmountModal(fp, next);
+}
+
+function openDueAmountModal(fp, targetStatus) {
+  const t=allTxns.find(x=>x.fp===fp); if(!t) return;
+  const dueAmt = t.amount||0;
+  const prevAmt = targetStatus==='acknowledged' ? (overrideStore[fp]?.paidAmt ?? dueAmt) : dueAmt;
+  const label = targetStatus==='paid' ? 'Paid amount' : 'Acknowledged amount';
+  const title = targetStatus==='paid' ? 'Mark as Paid' : 'Confirm Acknowledged Amount';
+
+  document.getElementById('panel-title').textContent = title;
+  document.getElementById('panel-body').innerHTML = `
+    <div style="font-size:12px;color:var(--text2);margin-bottom:12px">
+      Due amount: <b style="color:var(--text)">${fmtAmt(t)}</b>${t.dueDate?` · Due ${t.dueDate}`:''}
+    </div>
+    <div class="mfield" style="margin-bottom:4px">
+      <label>${label}</label>
+      <input type="number" id="due-amt-input" step="0.01" min="0" inputmode="decimal" value="${prevAmt||''}" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:14px;outline:none;width:100%">
+    </div>
+    <div id="due-amt-hint" style="font-size:11px;color:var(--text3);margin-top:4px"></div>`;
+
+  const ftr=document.querySelector('.panel-ftr');
+  ftr.innerHTML=`
+    <button class="btn-cancel" style="flex:1" onclick="closePanel()">Cancel</button>
+    <button class="btn-confirm" style="flex:1" onclick="confirmDueAmount('${fp}','${targetStatus}')">Confirm</button>`;
+  document.getElementById('panel-overlay').classList.add('open');
+  setTimeout(()=>{ const el=document.getElementById('due-amt-input'); if(el){el.focus(); el.select();} }, 50);
+}
+
+function confirmDueAmount(fp, targetStatus) {
+  const t=allTxns.find(x=>x.fp===fp); if(!t) return;
+  const input=document.getElementById('due-amt-input');
+  const val=parseFloat(input?.value);
+  if (isNaN(val) || val<0) {
+    const hint=document.getElementById('due-amt-hint');
+    if (hint) { hint.textContent='Enter a valid amount'; hint.style.color='var(--red)'; }
+    return;
+  }
+  const dueAmt=t.amount||0;
+  const partial = val < dueAmt-1;
+
+  if (!overrideStore[fp]) overrideStore[fp]={};
+  overrideStore[fp].dueStatus = targetStatus;
+  if (partial) overrideStore[fp].flagReason='partial'; else delete overrideStore[fp].flagReason;
+  if (targetStatus==='paid') overrideStore[fp].paidAmt=val;
+  if (targetStatus==='acknowledged') overrideStore[fp].ackAmt=val;
+
+  saveAll(); closePanel(); allTxns=getAllTxns(); renderAll();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2603,6 +2623,9 @@ function switchTab(name) {
   if (el) {
     el.style.display = el.classList.contains('two-col-tab') ? 'flex' : 'block';
   }
+  // The active tab's heavy list isn't built until it's actually switched to —
+  // build it now (uses the cached filtered groups from the last renderAll()).
+  renderActiveTabList();
 }
 document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab)));
 
@@ -2842,6 +2865,20 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const SUPABASE_TABLE = 'user_data';
 
 let supabaseSession = null; // stores { user_id, access_token }
+let lastSyncAt = LS.get('last_sync_at') || null; // ISO string of last successful push OR pull
+let syncIntervalTimer = null;
+let syncInProgress = false; // drives progress indicator on push/pull buttons
+
+// Only financial-type messages are synced (~2.5-3.5k of the 21k+ total).
+// 'other' (promos, OTPs, balance-only chatter) never leaves the phone —
+// keeps the payload small enough that mobile Chrome doesn't choke on it.
+function getSyncableSms() {
+  const out = {};
+  for (const [fp, t] of Object.entries(smsStore)) {
+    if (t.type !== 'other') out[fp] = t;
+  }
+  return out;
+}
 
 async function supabaseRequest(path, method='GET', body=null, token=null) {
   const headers = {
@@ -2865,39 +2902,105 @@ async function supabaseLogin(email, password) {
   });
   const data = await res.json();
   if (data.error) throw new Error(data.error_description || data.error);
-  supabaseSession = { user_id: data.user.id, access_token: data.access_token };
+  // expires_in is seconds from now; store an absolute expiry so we can check
+  // "is this token about to expire" without re-decoding the JWT.
+  const expiresAt = Date.now() + (data.expires_in||3600)*1000;
+  supabaseSession = { user_id: data.user.id, access_token: data.access_token, refresh_token: data.refresh_token, expires_at: expiresAt };
+  LS.set('sb_session', supabaseSession);
+  startSyncInterval();
+  return supabaseSession;
+}
+
+// Exchanges the stored refresh_token for a new access_token. Supabase access
+// tokens expire after ~1hr; without this, any session left open longer than
+// that fails every request with "JWT expired" until the user manually
+// signs out and back in.
+async function supabaseRefreshToken() {
+  if (!supabaseSession?.refresh_token) throw new Error('No refresh token available — please sign in again');
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY},
+    body: JSON.stringify({refresh_token: supabaseSession.refresh_token})
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error_description || data.error);
+  const expiresAt = Date.now() + (data.expires_in||3600)*1000;
+  supabaseSession = { user_id: data.user.id, access_token: data.access_token, refresh_token: data.refresh_token, expires_at: expiresAt };
   LS.set('sb_session', supabaseSession);
   return supabaseSession;
 }
 
+// Call before any authenticated request. Refreshes proactively if the token
+// is expired or about to expire (60s buffer), so requests don't fail on a
+// token that's technically still valid but will die mid-flight.
+async function ensureFreshToken() {
+  if (!supabaseSession) return;
+  const soon = Date.now() + 60000;
+  if (!supabaseSession.expires_at || supabaseSession.expires_at < soon) {
+    await supabaseRefreshToken();
+  }
+}
+
 async function supabaseLoad() {
   if (!SUPABASE_URL || !supabaseSession) return false;
+  syncInProgress = true; updateSyncStatus('↓ Pulling…', 'var(--text2)', true);
   try {
+    await ensureFreshToken();
     const rows = await supabaseRequest(
-      `${SUPABASE_TABLE}?user_id=eq.${supabaseSession.user_id}&select=data`,
+      `${SUPABASE_TABLE}?user_id=eq.${supabaseSession.user_id}&select=data,updated_at`,
       'GET', null, supabaseSession.access_token
     );
     if (rows && rows.length > 0 && rows[0].data) {
+      const remoteUpdatedAt = rows[0].updated_at;
+      // Conflict resolution: whole-payload last-write-wins. If our local copy
+      // was modified more recently than the remote row, skip the merge so a
+      // stale pull can't clobber fresher local edits — push instead.
+      const localUpdatedAt = LS.get('last_local_change_at');
+      if (localUpdatedAt && remoteUpdatedAt && localUpdatedAt > remoteUpdatedAt) {
+        console.warn('supabaseLoad: local changes are newer than remote, skipping merge — pushing instead');
+        syncInProgress = false;
+        await supabaseSave();
+        return false;
+      }
       const data = rows[0].data;
-      if (data.smsStore) smsStore={...smsStore,...data.smsStore};
+      if (data.smsStore) smsStore = {...smsStore, ...data.smsStore}; // financial-only subset
       if (data.merchantMap) merchantMap={...merchantMap,...data.merchantMap};
       if (data.overrideStore) overrideStore={...overrideStore,...data.overrideStore};
       if (data.manualStore) manualStore={...manualStore,...data.manualStore};
       if (data.typeRules) { const e=LS.get('type_rules')||{}; LS.set('type_rules',{...e,...data.typeRules}); }
-      saveAll();
+      LS.set('sms_store', smsStore);
+      LS.set('merchant_map', merchantMap);
+      LS.set('override_store', overrideStore);
+      LS.set('manual_store', manualStore);
+      syncDirty = false;
+      lastSyncAt = new Date().toISOString();
+      LS.set('last_sync_at', lastSyncAt);
+      // Re-run getAllTxns so pulled classifications apply to locally-stored SMS
+      if (typeof getAllTxns === 'function') {
+        allTxns = getAllTxns();
+        if (typeof matchDueStatuses === 'function') matchDueStatuses(allTxns);
+        allTxns = getAllTxns();
+      }
+      syncInProgress = false; updateSyncStatus('✓ Synced', 'var(--green)');
       return true;
     }
+    syncInProgress = false; updateSyncStatus('', 'var(--text2)');
     return false;
-  } catch(e) { console.warn('Supabase load failed:', e.message); return false; }
+  } catch(e) {
+    syncInProgress = false; updateSyncStatus(`⚠ Pull failed: ${e.message}`, 'var(--amber)');
+    console.warn('Supabase load failed:', e.message); return false;
+  }
 }
 
 async function supabaseSave() {
   if (!SUPABASE_URL || !supabaseSession) return;
+  syncInProgress = true; updateSyncStatus('↑ Pushing…', 'var(--text2)', true);
   try {
+    await ensureFreshToken();
     const typeRules = LS.get('type_rules')||{};
     const payload = {
       user_id: supabaseSession.user_id,
-      data: {smsStore, merchantMap, overrideStore, manualStore, typeRules},
+      data: {smsStore: getSyncableSms(), merchantMap, overrideStore, manualStore, typeRules},
       updated_at: new Date().toISOString()
     };
     // Use upsert via POST with Prefer: resolution=merge-duplicates
@@ -2915,16 +3018,74 @@ async function supabaseSave() {
       const err = await res.text();
       throw new Error(err);
     }
-    updateSyncStatus('✓ Synced', 'var(--green)');
+    syncDirty = false;
+    lastSyncAt = payload.updated_at;
+    LS.set('last_sync_at', lastSyncAt);
+    syncInProgress = false; updateSyncStatus('✓ Synced', 'var(--green)');
   } catch(e) {
-    updateSyncStatus('⚠ Sync failed', 'var(--amber)');
+    syncInProgress = false; updateSyncStatus(`⚠ Sync failed: ${e.message}`, 'var(--amber)');
     console.warn('Supabase save:', e.message);
   }
 }
 
-function updateSyncStatus(msg, col) {
+// Periodic auto-sync: every 30s while a session is active AND there are
+// unsynced local changes. Replaces the old 800ms-debounced sync-on-every-change.
+function startSyncInterval() {
+  clearInterval(syncIntervalTimer);
+  syncIntervalTimer = setInterval(() => {
+    if (supabaseSession && syncDirty && !syncInProgress) supabaseSave();
+  }, 30000);
+}
+
+// Safety net: a change made just before closing the tab would otherwise wait
+// up to 30s to sync. Best-effort push on unload so it isn't lost.
+window.addEventListener('beforeunload', () => {
+  if (supabaseSession && syncDirty && navigator.sendBeacon) {
+    try {
+      const typeRules = LS.get('type_rules')||{};
+      const payload = JSON.stringify({
+        user_id: supabaseSession.user_id,
+        data: {smsStore: getSyncableSms(), merchantMap, overrideStore, manualStore, typeRules},
+        updated_at: new Date().toISOString()
+      });
+      navigator.sendBeacon(
+        `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?apikey=${SUPABASE_ANON_KEY}`,
+        new Blob([payload], {type:'application/json'})
+      );
+    } catch(e) { /* best effort only */ }
+  }
+});
+
+function updateSyncStatus(msg, col, spinning) {
   const el=document.getElementById('sync-status');
-  if(el){el.textContent=msg;el.style.color=col;setTimeout(()=>{el.textContent='';},3000);}
+  if(el){
+    el.innerHTML = spinning ? `<span class="sync-spinner"></span>${msg}` : msg;
+    el.style.color=col;
+    // Auto-clear success/neutral messages after 3s, but leave errors on screen
+    // so they can actually be read (or screenshotted) instead of vanishing.
+    const isError = msg.startsWith('⚠');
+    if (!spinning && !isError) setTimeout(()=>{ if(!syncInProgress) el.textContent='' }, 3000);
+  }
+  // Also refresh the settings panel's sync status / timestamp if it's open
+  const panelEl = document.getElementById('sync-status-panel');
+  if (panelEl) {
+    panelEl.innerHTML = spinning ? `<span class="sync-spinner"></span>${msg}` : msg;
+    panelEl.style.color = col;
+  }
+  const tsEl = document.getElementById('last-sync-ts');
+  if (tsEl) tsEl.textContent = formatLastSync();
+}
+
+function formatLastSync() {
+  if (!lastSyncAt) return 'Never synced';
+  const d = new Date(lastSyncAt);
+  const diffMs = Date.now() - d.getTime();
+  const mins = Math.floor(diffMs/60000);
+  if (mins < 1) return 'Last synced just now';
+  if (mins < 60) return `Last synced ${mins}m ago`;
+  const hrs = Math.floor(mins/60);
+  if (hrs < 24) return `Last synced ${hrs}h ago`;
+  return `Last synced ${d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'})} ${d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}`;
 }
 
 // ── SETTINGS PANEL ──────────────────────────────────────────
@@ -2937,10 +3098,12 @@ function openSettings() {
       <div style="font-size:12px;font-weight:700;color:var(--text2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">Cloud Sync (Supabase)</div>
       ${!configured ? `<div style="font-size:12px;color:var(--amber);background:rgba(245,158,11,.1);border-radius:8px;padding:10px;margin-bottom:12px">⚠ Supabase not configured yet. Add your Project URL and anon key to the HTML file.</div>` : ''}
       ${loggedIn ? `
-        <div style="font-size:12px;color:var(--green);margin-bottom:10px">✓ Connected as ${supabaseSession.user_id?.slice(0,8)}…</div>
-        <button onclick="supabaseSave().then(()=>alert('Synced!'))" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↑ Push data to cloud</button>
-        <button onclick="supabaseLoad().then(r=>{if(r){allTxns=getAllTxns();matchDueStatuses(allTxns);allTxns=getAllTxns();populateFilters();buildMonthNav();renderAll();document.getElementById('upload-screen').style.display='none';document.getElementById('app-screen').style.display='flex';document.getElementById('fab-btn').style.display='flex';document.getElementById('hdr-meta').innerHTML='<b>'+allTxns.length+'</b> messages · synced from cloud';closePanel();}else alert('No cloud data found.');})" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↓ Pull data from cloud</button>
-        <button onclick="supabaseSession=null;LS.set('sb_session',null);closePanel();updateSyncStatus('Logged out','var(--text2)')" style="width:100%;padding:9px;background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--red);font-size:12px;cursor:pointer">Sign out</button>
+        <div style="font-size:12px;color:var(--green);margin-bottom:4px">✓ Connected as ${supabaseSession.user_id?.slice(0,8)}…</div>
+        <div id="last-sync-ts" style="font-size:11px;color:var(--text3);margin-bottom:10px">${formatLastSync()}</div>
+        <button id="sb-push-btn" onclick="uiPush()" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↑ Push to cloud</button>
+        <button id="sb-pull-btn" onclick="uiPull()" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↓ Pull from cloud</button>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:10px;line-height:1.5">Syncs classifications, notes, and financial transactions (~2-3k messages). Promotional/OTP messages stay on this device only.</div>
+        <button onclick="supabaseSession=null;LS.set('sb_session',null);clearInterval(syncIntervalTimer);closePanel();updateSyncStatus('Logged out','var(--text2)')" style="width:100%;padding:9px;background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--red);font-size:12px;cursor:pointer">Sign out</button>
       ` : `
         <div class="mfield" style="margin-bottom:10px"><label>Email</label><input type="email" id="sb-email" class="mfield input" placeholder="your@email.com" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 11px;color:var(--text);font-size:13px;outline:none;width:100%"></div>
         <div class="mfield" style="margin-bottom:12px"><label>Password</label><input type="password" id="sb-pw" class="mfield input" placeholder="••••••••" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 11px;color:var(--text);font-size:13px;outline:none;width:100%"></div>
@@ -2948,7 +3111,7 @@ function openSettings() {
         <div id="sb-error" style="font-size:11px;color:var(--red);margin-top:8px;display:none"></div>
       `}
     </div>
-    <div id="sync-status" style="font-size:11px;text-align:center;height:16px"></div>`;
+    <div id="sync-status-panel" style="font-size:11px;text-align:center;min-height:16px;line-height:1.5;word-break:break-word;padding:0 4px"></div>`;
 
   if (!loggedIn) {
     setTimeout(()=>{
@@ -2977,20 +3140,46 @@ function openSettings() {
   document.getElementById('panel-overlay').classList.add('open');
 }
 
+// Push button handler — disables button + shows spinner while in flight
+async function uiPush() {
+  const btn = document.getElementById('sb-push-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="sync-spinner"></span>Pushing…'; }
+  await supabaseSave();
+  if (btn) { btn.disabled = false; btn.textContent = '↑ Push to cloud'; }
+}
+
+// Pull button handler — disables button + shows spinner while in flight
+async function uiPull() {
+  const btn = document.getElementById('sb-pull-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="sync-spinner"></span>Pulling…'; }
+  const r = await supabaseLoad();
+  if (btn) { btn.disabled = false; btn.textContent = '↓ Pull from cloud'; }
+  if (r) {
+    populateFilters(); buildMonthNav(); renderAll();
+    if (Object.keys(smsStore).length > 0) {
+      document.getElementById('upload-screen').style.display='none';
+      document.getElementById('app-screen').style.display='flex';
+      document.getElementById('fab-btn').style.display='flex';
+      document.getElementById('hdr-meta').innerHTML=`<b>${allTxns.length}</b> messages · synced from cloud`;
+    }
+    closePanel();
+  } else {
+    alert('No cloud data found.');
+  }
+}
+
 // Restore session on load — auto-sync from Supabase if session exists
 window.addEventListener('load', async ()=>{
   const saved = LS.get('sb_session');
   if (saved?.access_token) {
     supabaseSession = saved;
-    updateSyncStatus('↓ Syncing…', 'var(--text2)');
+    startSyncInterval();
+    updateSyncStatus('↓ Syncing…', 'var(--text2)', true);
     try {
       const loaded = await supabaseLoad();
       if (loaded) {
-        allTxns = getAllTxns();
-        matchDueStatuses(allTxns);
-        allTxns = getAllTxns();
         populateFilters(); buildMonthNav(); renderAll();
-        // Show app if data loaded from cloud
+        // Show app if data loaded from cloud (includes financial SMS now)
         if (Object.keys(smsStore).length > 0) {
           document.getElementById('upload-screen').style.display='none';
           document.getElementById('app-screen').style.display='flex';
@@ -3019,6 +3208,31 @@ window.addEventListener('load', async ()=>{
     document.getElementById('hdr-meta').innerHTML=`<b>${allTxns.length}</b> messages · restored from memory`;
   }
 });
+
+// Exports just the uncategorised merchants (name, spend, sample SMS) in a shape
+// meant to be handed to an AI for categorization. The AI's response — a JSON
+// object shaped { merchantMap: { merchant: category } } — can be dropped straight
+// into the existing Import button below, since it already merges data.merchantMap.
+function exportUncategorisedMerchants() {
+  const groups={};
+  allTxns.filter(t=>t.type==='debit'&&getCategory(t)==='Uncategorised').forEach(t=>{
+    const m=t.merchant||'(no merchant)';
+    if(!groups[m]) groups[m]={merchant:m,count:0,totalAED:0,sample:(t.body||'').substring(0,140)};
+    groups[m].count++;
+    if(t.currency==='AED') groups[m].totalAED+=(t.amount||0);
+  });
+  const merchants=Object.values(groups).sort((a,b)=>b.totalAED-a.totalAED);
+  if (!merchants.length) { alert('No uncategorised merchants to export.'); return; }
+  const categories=Object.keys(CAT_ICONS).filter(c=>c!=='Uncategorised');
+  const payload={
+    instructions:"Assign each merchant below to ONE of the listed categories, using its name and the sample SMS text as context. Return ONLY a JSON object shaped exactly like { \"merchantMap\": { \"<merchant exactly as given>\": \"<category>\" } }, covering every merchant listed. Use 'Other' only if truly nothing else fits.",
+    categories,
+    merchants: merchants.map(m=>({merchant:m.merchant,count:m.count,totalSpendAED:Math.round(m.totalAED*100)/100,sampleSms:m.sample}))
+  };
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download=`uncategorised_merchants_${new Date().toISOString().split('T')[0]}.json`; a.click();
+}
 
 function exportData() {
   const typeRules = LS.get('type_rules') || {};
