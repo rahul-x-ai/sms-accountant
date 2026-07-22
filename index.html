@@ -2936,7 +2936,7 @@ async function supabaseLoad() {
     syncInProgress = false; updateSyncStatus('', 'var(--text2)');
     return false;
   } catch(e) {
-    syncInProgress = false; updateSyncStatus('⚠ Pull failed', 'var(--amber)');
+    syncInProgress = false; updateSyncStatus(`⚠ Pull failed: ${e.message}`, 'var(--amber)');
     console.warn('Supabase load failed:', e.message); return false;
   }
 }
@@ -2971,7 +2971,7 @@ async function supabaseSave() {
     LS.set('last_sync_at', lastSyncAt);
     syncInProgress = false; updateSyncStatus('✓ Synced', 'var(--green)');
   } catch(e) {
-    syncInProgress = false; updateSyncStatus('⚠ Sync failed', 'var(--amber)');
+    syncInProgress = false; updateSyncStatus(`⚠ Sync failed: ${e.message}`, 'var(--amber)');
     console.warn('Supabase save:', e.message);
   }
 }
@@ -3009,7 +3009,10 @@ function updateSyncStatus(msg, col, spinning) {
   if(el){
     el.innerHTML = spinning ? `<span class="sync-spinner"></span>${msg}` : msg;
     el.style.color=col;
-    if (!spinning) setTimeout(()=>{ if(!syncInProgress) el.textContent='' }, 3000);
+    // Auto-clear success/neutral messages after 3s, but leave errors on screen
+    // so they can actually be read (or screenshotted) instead of vanishing.
+    const isError = msg.startsWith('⚠');
+    if (!spinning && !isError) setTimeout(()=>{ if(!syncInProgress) el.textContent='' }, 3000);
   }
   // Also refresh the settings panel's sync status / timestamp if it's open
   const panelEl = document.getElementById('sync-status-panel');
@@ -3056,7 +3059,7 @@ function openSettings() {
         <div id="sb-error" style="font-size:11px;color:var(--red);margin-top:8px;display:none"></div>
       `}
     </div>
-    <div id="sync-status-panel" style="font-size:11px;text-align:center;height:16px"></div>`;
+    <div id="sync-status-panel" style="font-size:11px;text-align:center;min-height:16px;line-height:1.5;word-break:break-word;padding:0 4px"></div>`;
 
   if (!loggedIn) {
     setTimeout(()=>{
