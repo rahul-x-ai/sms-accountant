@@ -232,6 +232,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14
 .hbtn{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:5px 10px;color:var(--text2);font-size:11px;cursor:pointer;white-space:nowrap;transition:var(--tr);}
 .hbtn:hover{color:var(--text);}
 .hbtn.warn{color:var(--amber);}
+.hbtn:disabled{opacity:.5;cursor:not-allowed;}
+.sync-spinner{display:inline-block;width:10px;height:10px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:sync-spin .7s linear infinite;margin-right:5px;vertical-align:-1px;}
+@keyframes sync-spin{to{transform:rotate(360deg);}}
 
 /* UPLOAD */
 #upload-screen{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px;overflow-y:auto;}
@@ -819,16 +822,19 @@ let smsStore      = LS.get('sms_store')      || {};
 let merchantMap   = LS.get('merchant_map')   || {};
 let overrideStore = LS.get('override_store') || {};
 let manualStore   = LS.get('manual_store')   || {};  // manually entered transactions
+let syncDirty     = false; // set true on any local change; cleared after a successful push
 
 function saveAll() {
   LS.set('sms_store', smsStore);
   LS.set('merchant_map', merchantMap);
   LS.set('override_store', overrideStore);
   LS.set('manual_store', manualStore);
-  // Auto-sync to Supabase if session active
+  LS.set('last_local_change_at', new Date().toISOString());
+  // Sync no longer fires per-change (was 800ms debounce) — a 30s interval timer
+  // (started on login / session restore) handles periodic push instead. We just
+  // mark data as dirty here so that timer knows there's something to push.
   if (typeof supabaseSession !== 'undefined' && supabaseSession) {
-    clearTimeout(saveAll._sbTimer);
-    saveAll._sbTimer = setTimeout(supabaseSave, 800);
+    syncDirty = true;
   }
 }
 
@@ -2842,6 +2848,20 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const SUPABASE_TABLE = 'user_data';
 
 let supabaseSession = null; // stores { user_id, access_token }
+let lastSyncAt = LS.get('last_sync_at') || null; // ISO string of last successful push OR pull
+let syncIntervalTimer = null;
+let syncInProgress = false; // drives progress indicator on push/pull buttons
+
+// Only financial-type messages are synced (~2.5-3.5k of the 21k+ total).
+// 'other' (promos, OTPs, balance-only chatter) never leaves the phone —
+// keeps the payload small enough that mobile Chrome doesn't choke on it.
+function getSyncableSms() {
+  const out = {};
+  for (const [fp, t] of Object.entries(smsStore)) {
+    if (t.type !== 'other') out[fp] = t;
+  }
+  return out;
+}
 
 async function supabaseRequest(path, method='GET', body=null, token=null) {
   const headers = {
@@ -2867,37 +2887,68 @@ async function supabaseLogin(email, password) {
   if (data.error) throw new Error(data.error_description || data.error);
   supabaseSession = { user_id: data.user.id, access_token: data.access_token };
   LS.set('sb_session', supabaseSession);
+  startSyncInterval();
   return supabaseSession;
 }
 
 async function supabaseLoad() {
   if (!SUPABASE_URL || !supabaseSession) return false;
+  syncInProgress = true; updateSyncStatus('↓ Pulling…', 'var(--text2)', true);
   try {
     const rows = await supabaseRequest(
-      `${SUPABASE_TABLE}?user_id=eq.${supabaseSession.user_id}&select=data`,
+      `${SUPABASE_TABLE}?user_id=eq.${supabaseSession.user_id}&select=data,updated_at`,
       'GET', null, supabaseSession.access_token
     );
     if (rows && rows.length > 0 && rows[0].data) {
+      const remoteUpdatedAt = rows[0].updated_at;
+      // Conflict resolution: whole-payload last-write-wins. If our local copy
+      // was modified more recently than the remote row, skip the merge so a
+      // stale pull can't clobber fresher local edits — push instead.
+      const localUpdatedAt = LS.get('last_local_change_at');
+      if (localUpdatedAt && remoteUpdatedAt && localUpdatedAt > remoteUpdatedAt) {
+        console.warn('supabaseLoad: local changes are newer than remote, skipping merge — pushing instead');
+        syncInProgress = false;
+        await supabaseSave();
+        return false;
+      }
       const data = rows[0].data;
-      if (data.smsStore) smsStore={...smsStore,...data.smsStore};
+      if (data.smsStore) smsStore = {...smsStore, ...data.smsStore}; // financial-only subset
       if (data.merchantMap) merchantMap={...merchantMap,...data.merchantMap};
       if (data.overrideStore) overrideStore={...overrideStore,...data.overrideStore};
       if (data.manualStore) manualStore={...manualStore,...data.manualStore};
       if (data.typeRules) { const e=LS.get('type_rules')||{}; LS.set('type_rules',{...e,...data.typeRules}); }
-      saveAll();
+      LS.set('sms_store', smsStore);
+      LS.set('merchant_map', merchantMap);
+      LS.set('override_store', overrideStore);
+      LS.set('manual_store', manualStore);
+      syncDirty = false;
+      lastSyncAt = new Date().toISOString();
+      LS.set('last_sync_at', lastSyncAt);
+      // Re-run getAllTxns so pulled classifications apply to locally-stored SMS
+      if (typeof getAllTxns === 'function') {
+        allTxns = getAllTxns();
+        if (typeof matchDueStatuses === 'function') matchDueStatuses(allTxns);
+        allTxns = getAllTxns();
+      }
+      syncInProgress = false; updateSyncStatus('✓ Synced', 'var(--green)');
       return true;
     }
+    syncInProgress = false; updateSyncStatus('', 'var(--text2)');
     return false;
-  } catch(e) { console.warn('Supabase load failed:', e.message); return false; }
+  } catch(e) {
+    syncInProgress = false; updateSyncStatus('⚠ Pull failed', 'var(--amber)');
+    console.warn('Supabase load failed:', e.message); return false;
+  }
 }
 
 async function supabaseSave() {
   if (!SUPABASE_URL || !supabaseSession) return;
+  syncInProgress = true; updateSyncStatus('↑ Pushing…', 'var(--text2)', true);
   try {
     const typeRules = LS.get('type_rules')||{};
     const payload = {
       user_id: supabaseSession.user_id,
-      data: {smsStore, merchantMap, overrideStore, manualStore, typeRules},
+      data: {smsStore: getSyncableSms(), merchantMap, overrideStore, manualStore, typeRules},
       updated_at: new Date().toISOString()
     };
     // Use upsert via POST with Prefer: resolution=merge-duplicates
@@ -2915,16 +2966,71 @@ async function supabaseSave() {
       const err = await res.text();
       throw new Error(err);
     }
-    updateSyncStatus('✓ Synced', 'var(--green)');
+    syncDirty = false;
+    lastSyncAt = payload.updated_at;
+    LS.set('last_sync_at', lastSyncAt);
+    syncInProgress = false; updateSyncStatus('✓ Synced', 'var(--green)');
   } catch(e) {
-    updateSyncStatus('⚠ Sync failed', 'var(--amber)');
+    syncInProgress = false; updateSyncStatus('⚠ Sync failed', 'var(--amber)');
     console.warn('Supabase save:', e.message);
   }
 }
 
-function updateSyncStatus(msg, col) {
+// Periodic auto-sync: every 30s while a session is active AND there are
+// unsynced local changes. Replaces the old 800ms-debounced sync-on-every-change.
+function startSyncInterval() {
+  clearInterval(syncIntervalTimer);
+  syncIntervalTimer = setInterval(() => {
+    if (supabaseSession && syncDirty && !syncInProgress) supabaseSave();
+  }, 30000);
+}
+
+// Safety net: a change made just before closing the tab would otherwise wait
+// up to 30s to sync. Best-effort push on unload so it isn't lost.
+window.addEventListener('beforeunload', () => {
+  if (supabaseSession && syncDirty && navigator.sendBeacon) {
+    try {
+      const typeRules = LS.get('type_rules')||{};
+      const payload = JSON.stringify({
+        user_id: supabaseSession.user_id,
+        data: {smsStore: getSyncableSms(), merchantMap, overrideStore, manualStore, typeRules},
+        updated_at: new Date().toISOString()
+      });
+      navigator.sendBeacon(
+        `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?apikey=${SUPABASE_ANON_KEY}`,
+        new Blob([payload], {type:'application/json'})
+      );
+    } catch(e) { /* best effort only */ }
+  }
+});
+
+function updateSyncStatus(msg, col, spinning) {
   const el=document.getElementById('sync-status');
-  if(el){el.textContent=msg;el.style.color=col;setTimeout(()=>{el.textContent='';},3000);}
+  if(el){
+    el.innerHTML = spinning ? `<span class="sync-spinner"></span>${msg}` : msg;
+    el.style.color=col;
+    if (!spinning) setTimeout(()=>{ if(!syncInProgress) el.textContent='' }, 3000);
+  }
+  // Also refresh the settings panel's sync status / timestamp if it's open
+  const panelEl = document.getElementById('sync-status-panel');
+  if (panelEl) {
+    panelEl.innerHTML = spinning ? `<span class="sync-spinner"></span>${msg}` : msg;
+    panelEl.style.color = col;
+  }
+  const tsEl = document.getElementById('last-sync-ts');
+  if (tsEl) tsEl.textContent = formatLastSync();
+}
+
+function formatLastSync() {
+  if (!lastSyncAt) return 'Never synced';
+  const d = new Date(lastSyncAt);
+  const diffMs = Date.now() - d.getTime();
+  const mins = Math.floor(diffMs/60000);
+  if (mins < 1) return 'Last synced just now';
+  if (mins < 60) return `Last synced ${mins}m ago`;
+  const hrs = Math.floor(mins/60);
+  if (hrs < 24) return `Last synced ${hrs}h ago`;
+  return `Last synced ${d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'})} ${d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}`;
 }
 
 // ── SETTINGS PANEL ──────────────────────────────────────────
@@ -2937,10 +3043,12 @@ function openSettings() {
       <div style="font-size:12px;font-weight:700;color:var(--text2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">Cloud Sync (Supabase)</div>
       ${!configured ? `<div style="font-size:12px;color:var(--amber);background:rgba(245,158,11,.1);border-radius:8px;padding:10px;margin-bottom:12px">⚠ Supabase not configured yet. Add your Project URL and anon key to the HTML file.</div>` : ''}
       ${loggedIn ? `
-        <div style="font-size:12px;color:var(--green);margin-bottom:10px">✓ Connected as ${supabaseSession.user_id?.slice(0,8)}…</div>
-        <button onclick="supabaseSave().then(()=>alert('Synced!'))" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↑ Push data to cloud</button>
-        <button onclick="supabaseLoad().then(r=>{if(r){allTxns=getAllTxns();matchDueStatuses(allTxns);allTxns=getAllTxns();populateFilters();buildMonthNav();renderAll();document.getElementById('upload-screen').style.display='none';document.getElementById('app-screen').style.display='flex';document.getElementById('fab-btn').style.display='flex';document.getElementById('hdr-meta').innerHTML='<b>'+allTxns.length+'</b> messages · synced from cloud';closePanel();}else alert('No cloud data found.');})" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↓ Pull data from cloud</button>
-        <button onclick="supabaseSession=null;LS.set('sb_session',null);closePanel();updateSyncStatus('Logged out','var(--text2)')" style="width:100%;padding:9px;background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--red);font-size:12px;cursor:pointer">Sign out</button>
+        <div style="font-size:12px;color:var(--green);margin-bottom:4px">✓ Connected as ${supabaseSession.user_id?.slice(0,8)}…</div>
+        <div id="last-sync-ts" style="font-size:11px;color:var(--text3);margin-bottom:10px">${formatLastSync()}</div>
+        <button id="sb-push-btn" onclick="uiPush()" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↑ Push to cloud</button>
+        <button id="sb-pull-btn" onclick="uiPull()" style="width:100%;padding:9px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;cursor:pointer;margin-bottom:8px">↓ Pull from cloud</button>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:10px;line-height:1.5">Syncs classifications, notes, and financial transactions (~2-3k messages). Promotional/OTP messages stay on this device only.</div>
+        <button onclick="supabaseSession=null;LS.set('sb_session',null);clearInterval(syncIntervalTimer);closePanel();updateSyncStatus('Logged out','var(--text2)')" style="width:100%;padding:9px;background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--red);font-size:12px;cursor:pointer">Sign out</button>
       ` : `
         <div class="mfield" style="margin-bottom:10px"><label>Email</label><input type="email" id="sb-email" class="mfield input" placeholder="your@email.com" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 11px;color:var(--text);font-size:13px;outline:none;width:100%"></div>
         <div class="mfield" style="margin-bottom:12px"><label>Password</label><input type="password" id="sb-pw" class="mfield input" placeholder="••••••••" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 11px;color:var(--text);font-size:13px;outline:none;width:100%"></div>
@@ -2948,7 +3056,7 @@ function openSettings() {
         <div id="sb-error" style="font-size:11px;color:var(--red);margin-top:8px;display:none"></div>
       `}
     </div>
-    <div id="sync-status" style="font-size:11px;text-align:center;height:16px"></div>`;
+    <div id="sync-status-panel" style="font-size:11px;text-align:center;height:16px"></div>`;
 
   if (!loggedIn) {
     setTimeout(()=>{
@@ -2977,20 +3085,46 @@ function openSettings() {
   document.getElementById('panel-overlay').classList.add('open');
 }
 
+// Push button handler — disables button + shows spinner while in flight
+async function uiPush() {
+  const btn = document.getElementById('sb-push-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="sync-spinner"></span>Pushing…'; }
+  await supabaseSave();
+  if (btn) { btn.disabled = false; btn.textContent = '↑ Push to cloud'; }
+}
+
+// Pull button handler — disables button + shows spinner while in flight
+async function uiPull() {
+  const btn = document.getElementById('sb-pull-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="sync-spinner"></span>Pulling…'; }
+  const r = await supabaseLoad();
+  if (btn) { btn.disabled = false; btn.textContent = '↓ Pull from cloud'; }
+  if (r) {
+    populateFilters(); buildMonthNav(); renderAll();
+    if (Object.keys(smsStore).length > 0) {
+      document.getElementById('upload-screen').style.display='none';
+      document.getElementById('app-screen').style.display='flex';
+      document.getElementById('fab-btn').style.display='flex';
+      document.getElementById('hdr-meta').innerHTML=`<b>${allTxns.length}</b> messages · synced from cloud`;
+    }
+    closePanel();
+  } else {
+    alert('No cloud data found.');
+  }
+}
+
 // Restore session on load — auto-sync from Supabase if session exists
 window.addEventListener('load', async ()=>{
   const saved = LS.get('sb_session');
   if (saved?.access_token) {
     supabaseSession = saved;
-    updateSyncStatus('↓ Syncing…', 'var(--text2)');
+    startSyncInterval();
+    updateSyncStatus('↓ Syncing…', 'var(--text2)', true);
     try {
       const loaded = await supabaseLoad();
       if (loaded) {
-        allTxns = getAllTxns();
-        matchDueStatuses(allTxns);
-        allTxns = getAllTxns();
         populateFilters(); buildMonthNav(); renderAll();
-        // Show app if data loaded from cloud
+        // Show app if data loaded from cloud (includes financial SMS now)
         if (Object.keys(smsStore).length > 0) {
           document.getElementById('upload-screen').style.display='none';
           document.getElementById('app-screen').style.display='flex';
