@@ -224,8 +224,9 @@ html,body{height:100%;overflow:hidden;}
 body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;display:flex;flex-direction:column;height:100%;}
 
 /* HEADER */
-.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:0 16px;height:50px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;gap:8px;}
+.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:8px 16px;min-height:50px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;gap:8px;flex-wrap:wrap;}
 .hdr-logo{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px;white-space:nowrap;}
+.hdr-ver{font-size:10px;font-weight:600;color:var(--text3);background:var(--surface2);border-radius:5px;padding:2px 6px;margin-left:2px;}
 .hdr-lm{width:26px;height:26px;border-radius:7px;background:var(--accentg);display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;}
 .hdr-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
 .hdr-meta{font-size:11px;color:var(--text2);white-space:nowrap;}
@@ -301,6 +302,13 @@ select.fil,select.sort-sel{background:var(--surface);border:1px solid var(--bord
   .two-col-tab{flex-direction:column;overflow:visible;}
   .col-sticky{width:100%;max-width:100%;border-right:none;border-bottom:1px solid var(--border);height:auto;overflow-y:visible;}
   .col-scroll{height:auto;}
+}
+@media(max-width:600px){
+  /* The message-count text is the least essential header item on a phone —
+     drop it first so the action buttons (Export/Import/Sync/New File) have
+     the best chance of fitting on one row without wrapping. */
+  .hdr-meta{display:none;}
+  .hbtn{padding:5px 8px;font-size:10px;}
 }
 .scroll-area::-webkit-scrollbar{width:4px;}
 .scroll-area::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
@@ -539,7 +547,7 @@ See full architecture notes inside the <head> comment block above.
 -->
 <!-- HEADER -->
 <div class="hdr">
-  <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant</div>
+  <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.6</span></div>
   <div class="hdr-r">
     <div class="hdr-meta" id="hdr-meta"></div>
     <span id="sync-status" style="font-size:11px;color:var(--green);white-space:nowrap"></span>
