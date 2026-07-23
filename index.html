@@ -547,7 +547,7 @@ See full architecture notes inside the <head> comment block above.
 -->
 <!-- HEADER -->
 <div class="hdr">
-  <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.7</span></div>
+  <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.8</span></div>
   <div class="hdr-r">
     <div class="hdr-meta" id="hdr-meta"></div>
     <span id="sync-status" style="font-size:11px;color:var(--green);white-space:nowrap"></span>
@@ -1758,9 +1758,10 @@ function renderCatChart(debits, containerId) {
     return;
   }
 
-  // No filter: show all categories ranked by total
+  // No filter: show all categories ranked by total, respecting whatever date/month
+  // filter is already applied to `debits` by the caller (renderAll -> applyFilters)
   const catTotals={};
-  allTxns.filter(t=>t.type==='debit'&&t.currency==='AED').forEach(t=>{
+  debits.filter(t=>t.currency==='AED').forEach(t=>{
     const c=getCategory(t)||'Other'; catTotals[c]=(catTotals[c]||0)+(t.amount||0);
   });
   const uncatTotal=catTotals['Uncategorised']||0;
@@ -1798,22 +1799,28 @@ function filterByMonth(monthKey) {
 function renderMiniChart(containerId, txnType, colorClass, txnsList) {
   const el=document.getElementById(containerId); if(!el) return;
 
-  // Always show 6 months. If a month filter is active, show that month + 5 before it.
-  // Otherwise show last 6 months from today.
-  let anchorDate;
+  // Always show 6 months. If no month filter is active, show last 6 months from today
+  // (5 before + current). If a month filter is active and it's the current or previous
+  // month, keep that same trailing window. If it's further back, center the window on
+  // the selected month instead: 3 months before it + the month itself + 2 months after.
+  const today = new Date();
+  let anchorDate, monthsBefore=5, monthsAfter=0;
   if (monthOffset !== null) {
     anchorDate = new Date(monthOffset.year, monthOffset.month, 1);
+    const monthsAgo = (today.getFullYear()-monthOffset.year)*12 + (today.getMonth()-monthOffset.month);
+    if (monthsAgo > 1) { monthsBefore=3; monthsAfter=2; }
   } else {
-    anchorDate = new Date();
+    anchorDate = today;
   }
   const months=[];
-  for(let i=5;i>=0;i--){
+  for(let i=monthsBefore;i>=-monthsAfter;i--){
     const d=new Date(anchorDate.getFullYear(),anchorDate.getMonth()-i,1);
     months.push({key:`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`,lbl:d.toLocaleDateString('en-GB',{month:'short',year:'2-digit'}),total:0});
   }
-  // Use ALL txns for history (not filtered) so prior months show real data
+  // Use ALL txns for history (not filtered by date) so prior/future months show real data.
+  // When a category is selected and this is the spends chart, restrict to that category too.
   const source = allTxns;
-  source.filter(t=>t.type===txnType&&t.amount&&t.currency==='AED').forEach(t=>{const mo=months.find(m=>m.key===t.monthKey);if(mo)mo.total+=t.amount;});
+  source.filter(t=>t.type===txnType&&t.amount&&t.currency==='AED'&&(txnType!=='debit'||!catFil||getCategory(t)===catFil)).forEach(t=>{const mo=months.find(m=>m.key===t.monthKey);if(mo)mo.total+=t.amount;});
   const max=Math.max(...months.map(m=>m.total),1);
   // Active month key for highlighting
   const activeKey = monthOffset!==null ? `${monthOffset.year}-${String(monthOffset.month+1).padStart(2,'0')}` : null;
