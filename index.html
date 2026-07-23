@@ -299,9 +299,9 @@ select.fil,select.sort-sel{background:var(--surface);border:1px solid var(--bord
 .col-scroll::-webkit-scrollbar{width:4px;}
 .col-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
 @media(max-width:768px){
-  .two-col-tab{flex-direction:column;overflow:visible;}
-  .col-sticky{width:100%;max-width:100%;border-right:none;border-bottom:1px solid var(--border);height:auto;overflow-y:visible;}
-  .col-scroll{height:auto;}
+  .two-col-tab{flex-direction:column;overflow-y:auto;overflow-x:hidden;}
+  .col-sticky{width:100%;max-width:100%;border-right:none;border-bottom:1px solid var(--border);height:auto;overflow-y:visible;flex-shrink:0;}
+  .col-scroll{height:auto;overflow-y:visible;}
 }
 @media(max-width:600px){
   /* The message-count text is the least essential header item on a phone —
@@ -547,7 +547,7 @@ See full architecture notes inside the <head> comment block above.
 -->
 <!-- HEADER -->
 <div class="hdr">
-  <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.6</span></div>
+  <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.7</span></div>
   <div class="hdr-r">
     <div class="hdr-meta" id="hdr-meta"></div>
     <span id="sync-status" style="font-size:11px;color:var(--green);white-space:nowrap"></span>
