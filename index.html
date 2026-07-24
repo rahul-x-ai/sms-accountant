@@ -229,12 +229,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14
 .hdr-ver{font-size:10px;font-weight:600;color:var(--text3);background:var(--surface2);border-radius:5px;padding:2px 6px;margin-left:2px;}
 .hdr-lm{width:26px;height:26px;border-radius:7px;background:var(--accentg);display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;}
 .hdr-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.hdr-left{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 .hdr-meta{font-size:11px;color:var(--text2);white-space:nowrap;}
 .hdr-meta b{color:var(--accent);}
 .hbtn{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:5px 10px;color:var(--text2);font-size:11px;cursor:pointer;white-space:nowrap;transition:var(--tr);}
 .hbtn:hover{color:var(--text);}
 .hbtn.warn{color:var(--amber);}
 .hbtn:disabled{opacity:.5;cursor:not-allowed;}
+#scan-btn{background:var(--accentg);color:#fff;border:none;font-weight:600;}
+#scan-btn:hover{opacity:.92;}
 .sync-spinner{display:inline-block;width:10px;height:10px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:sync-spin .7s linear infinite;margin-right:5px;vertical-align:-1px;}
 @keyframes sync-spin{to{transform:rotate(360deg);}}
 .load-more-btn{display:block;width:100%;padding:11px;margin-top:8px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text2);font-size:12px;font-weight:600;cursor:pointer;}
@@ -547,7 +550,10 @@ See full architecture notes inside the <head> comment block above.
 -->
 <!-- HEADER -->
 <div class="hdr">
-  <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.8</span></div>
+  <div class="hdr-left">
+    <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.9</span></div>
+    <button class="hbtn" id="scan-btn" onclick="handleScan()">⤓ Scan</button>
+  </div>
   <div class="hdr-r">
     <div class="hdr-meta" id="hdr-meta"></div>
     <span id="sync-status" style="font-size:11px;color:var(--green);white-space:nowrap"></span>
@@ -3316,6 +3322,74 @@ function processFile(file) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// SCAN — re-read the same SMS backup file without re-navigating
+// Uses the File System Access API (Chrome/Edge on Android + desktop).
+// First tap: user picks the file once, handle is remembered in IndexedDB.
+// Later taps: silently re-read that same file (permission allowing).
+// Browsers without the API (e.g. Safari) fall back to the normal picker each time.
+// ═══════════════════════════════════════════════════════════
+const FS_SUPPORTED = 'showOpenFilePicker' in window;
+function idbOpen(){
+  return new Promise((res,rej)=>{
+    const req=indexedDB.open('sms_tracker_fs',1);
+    req.onupgradeneeded=()=>req.result.createObjectStore('handles');
+    req.onsuccess=()=>res(req.result);
+    req.onerror=()=>rej(req.error);
+  });
+}
+async function idbGetHandle(){
+  const db=await idbOpen();
+  return new Promise((res,rej)=>{
+    const rq=db.transaction('handles','readonly').objectStore('handles').get('sms_backup');
+    rq.onsuccess=()=>res(rq.result||null);
+    rq.onerror=()=>rej(rq.error);
+  });
+}
+async function idbSetHandle(handle){
+  const db=await idbOpen();
+  return new Promise((res,rej)=>{
+    const tx=db.transaction('handles','readwrite');
+    tx.objectStore('handles').put(handle,'sms_backup');
+    tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error);
+  });
+}
+async function idbClearHandle(){
+  const db=await idbOpen();
+  return new Promise((res,rej)=>{
+    const tx=db.transaction('handles','readwrite');
+    tx.objectStore('handles').delete('sms_backup');
+    tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error);
+  });
+}
+async function handleScan(){
+  const btn=document.getElementById('scan-btn');
+  if(!FS_SUPPORTED){ document.getElementById('file-input').click(); return; }
+  const origLbl=btn.textContent;
+  btn.disabled=true; btn.textContent='⟳ Scanning…';
+  try{
+    let handle=await idbGetHandle();
+    if(handle){
+      let perm=await handle.queryPermission({mode:'read'});
+      if(perm!=='granted') perm=await handle.requestPermission({mode:'read'});
+      if(perm!=='granted') handle=null;
+    }
+    if(!handle){
+      try{
+        [handle]=await window.showOpenFilePicker({types:[{description:'SMS Backup XML',accept:{'text/xml':['.xml']}}]});
+        await idbSetHandle(handle);
+      }catch(e){ btn.disabled=false; btn.textContent=origLbl; return; } // user cancelled picker
+    }
+    const file=await handle.getFile();
+    processFile(file);
+  }catch(err){
+    await idbClearHandle();
+    alert('Could not re-read the SMS backup file (it may have moved). Please pick it again.\n\n'+err.message);
+  }finally{
+    setTimeout(()=>{ btn.disabled=false; btn.textContent=origLbl; },600);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // EVENT WIRING
 // ═══════════════════════════════════════════════════════════
 document.getElementById('file-input').addEventListener('change',e=>{ if(e.target.files[0]) processFile(e.target.files[0]); });
@@ -3324,6 +3398,7 @@ dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag-ove
 dz.addEventListener('dragleave',()=>dz.classList.remove('drag-over'));
 dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag-over');if(e.dataTransfer.files[0])processFile(e.dataTransfer.files[0]);});
 document.getElementById('upload-new-btn').addEventListener('click',()=>{
+  idbClearHandle(); // picking a new file resets the remembered Scan handle
   document.getElementById('app-screen').style.display='none';
   document.getElementById('upload-screen').style.display='flex';
   document.getElementById('fab-btn').style.display='none';
