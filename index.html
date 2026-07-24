@@ -324,11 +324,13 @@ select.fil,select.sort-sel{background:var(--surface);border:1px solid var(--bord
 .c-red::after{background:var(--red);} .c-green::after{background:var(--green);}
 .c-amber::after{background:var(--amber);} .c-blue::after{background:var(--blue);}
 .c-purple::after{background:var(--purple);} .c-orange::after{background:var(--orange);}
+.c-teal::after{background:#2dd4bf;}
 .stat-lbl{font-size:10px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:var(--text2);margin-bottom:7px;}
 .stat-val{font-size:22px;font-weight:700;font-family:var(--mono);}
 .stat-val.c-red{color:var(--red);} .stat-val.c-green{color:var(--green);}
 .stat-val.c-amber{color:var(--amber);} .stat-val.c-blue{color:var(--blue);}
 .stat-val.c-purple{color:var(--purple);} .stat-val.c-orange{color:var(--orange);}
+.stat-val.c-teal{color:#2dd4bf;}
 .stat-sub{font-size:11px;color:var(--text3);margin-top:4px;}
 
 /* CATEGORY CHART */
@@ -403,6 +405,8 @@ select.fil,select.sort-sel{background:var(--surface);border:1px solid var(--bord
 .due-status.acknowledged{background:rgba(34,199,122,.12);color:var(--green);}
 .due-status.flagged{background:rgba(239,68,68,.12);color:var(--red);}
 .due-status.rolled-over{background:rgba(139,92,246,.12);color:#8b5cf6;}
+.due-status.pending{background:rgba(45,212,191,.12);color:#2dd4bf;}
+.due-status.reimbursed{background:rgba(34,199,122,.12);color:var(--green);}
 
 /* SUBHEADER */
 .sub-hdr{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text2);margin:14px 0 7px;padding:5px 9px;background:var(--surface2);border-radius:6px;border-left:3px solid var(--accent);}
@@ -551,7 +555,7 @@ See full architecture notes inside the <head> comment block above.
 <!-- HEADER -->
 <div class="hdr">
   <div class="hdr-left">
-    <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v4.9</span></div>
+    <div class="hdr-logo"><div class="hdr-lm">💬</div>SMS Accountant<span class="hdr-ver">v5.0</span></div>
     <button class="hbtn" id="scan-btn" onclick="handleScan()">⤓ Scan</button>
   </div>
   <div class="hdr-r">
@@ -807,9 +811,9 @@ See full architecture notes inside the <head> comment block above.
 // ═══════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════
-const CATEGORIES = ['Dining','Fuel','Grocery','Travel','Car','Utilities','Medical','Shopping','Entertainment','Subscriptions','Education','Govt & Services','Repayment','Other','Uncategorised'];
-const CAT_COLORS = {Dining:'#f97316',Fuel:'#eab308',Grocery:'#22c55e',Travel:'#06b6d4',Car:'#8b5cf6',Utilities:'#3b82f6',Medical:'#ec4899',Shopping:'#f43f5e',Entertainment:'#a855f7',Subscriptions:'#14b8a6',Education:'#0ea5e9','Govt & Services':'#64748b',Repayment:'#94a3b8',Other:'#6b7280',Uncategorised:'#d97706'};
-const CAT_ICONS = {Dining:'🍴',Fuel:'⛽',Grocery:'🛒',Travel:'✈️',Car:'🚗',Utilities:'⚡',Medical:'🩺',Shopping:'🛍️',Entertainment:'🎬',Subscriptions:'🔄',Education:'📚','Govt & Services':'🏛️',Repayment:'↩️',Other:'•',Uncategorised:'?'};
+const CATEGORIES = ['Dining','Fuel','Grocery','Travel','Car','Utilities','Medical','Shopping','Entertainment','Subscriptions','Education','Govt & Services','Repayment','Reimbursable','Other','Uncategorised'];
+const CAT_COLORS = {Dining:'#f97316',Fuel:'#eab308',Grocery:'#22c55e',Travel:'#06b6d4',Car:'#8b5cf6',Utilities:'#3b82f6',Medical:'#ec4899',Shopping:'#f43f5e',Entertainment:'#a855f7',Subscriptions:'#14b8a6',Education:'#0ea5e9','Govt & Services':'#64748b',Repayment:'#94a3b8',Reimbursable:'#2dd4bf',Other:'#6b7280',Uncategorised:'#d97706'};
+const CAT_ICONS = {Dining:'🍴',Fuel:'⛽',Grocery:'🛒',Travel:'✈️',Car:'🚗',Utilities:'⚡',Medical:'🩺',Shopping:'🛍️',Entertainment:'🎬',Subscriptions:'🔄',Education:'📚','Govt & Services':'🏛️',Repayment:'↩️',Reimbursable:'🤝',Other:'•',Uncategorised:'?'};
 
 const AUTO_MERCHANT_KEYWORDS = {
   Dining:['restaurant','cafe','cafeteria','coffee','pizza','burger','grill','diner','bakery','kitchen','biryani','shawarma','sushi','steak','food','canteen','lounge','eatery','bbq','wok','noodle','bake','toast','juice','tea house','sweets'],
@@ -1423,6 +1427,7 @@ function getAllTxns() {
     return {
       ...t, type:ov.type||t.type, dueStatus:ov.dueStatus||null, paidAmt:ov.paidAmt||null,
       ackAmt:ov.ackAmt||null, flagReason:ov.flagReason||null, linkedMsgs:ov.linkedMsgs||[], reminderFps:ov.reminderFps||[],
+      reimbStatus:ov.reimbStatus||null, reimbAmt:ov.reimbAmt||null, reimbFlagReason:ov.reimbFlagReason||null,
       isReminderDuplicate: t.type==='due' && reminderFpSet.has(t.fp),
     };
   });
@@ -1519,6 +1524,19 @@ function dueStatusHtml(t) {
   const labels={due:'⏳ Due','rolled-over':'↩️ Rolled Over',paid:partial?'⚠ Partial (Paid)':'💳 Paid',acknowledged:partial?'⚠ Partial (Acked)':'✅ Acknowledged'};
   const cls = partial ? 'flagged' : status;
   return `<span class="due-status ${cls}" onclick="event.stopPropagation();advanceDueStatus('${t.fp}')">${labels[status]||status}</span>`;
+}
+
+function isPartialReimb(t) {
+  return t.reimbStatus==='reimbursed' && t.reimbFlagReason==='partial';
+}
+
+function reimbStatusHtml(t) {
+  if (t.type!=='debit' || getCategory(t)!=='Reimbursable') return '';
+  const status=t.reimbStatus||'pending';
+  const partial=isPartialReimb(t);
+  const labels={pending:'🤝 Pending',reimbursed:partial?'⚠ Partial Reimbursed':'✅ Reimbursed'};
+  const cls = partial ? 'flagged' : status;
+  return `<span class="due-status ${cls}" onclick="event.stopPropagation();advanceReimbStatus('${t.fp}')">${labels[status]||status}</span>`;
 }
 
 function getCatIcon(t) {
@@ -1690,7 +1708,7 @@ function renderTxnItem(t) {
     <div class="txn-dot ${dotCls}" style="${dotStyle}">${getCatIcon(t)}</div>
     <div class="txn-main">
       <div class="txn-sender">${t.merchant||t.bank}${catBadgeHtml(t)}</div>
-      <div class="txn-sub">${t.bank}${t.acct?`<span class="txn-acct">···${t.acct}</span>`:''}${typeBadgeHtml(t)}</div>
+      <div class="txn-sub">${t.bank}${t.acct?`<span class="txn-acct">···${t.acct}</span>`:''}${typeBadgeHtml(t)}${reimbStatusHtml(t)}</div>
       <div class="txn-desc">${t.body.substring(0,80)}${t.body.length>80?'…':''}</div>
       ${overrideStore[t.fp]?.note?`<div class="txn-note">📝 ${overrideStore[t.fp].note.substring(0,60)}${overrideStore[t.fp].note.length>60?'…':''}</div>`:''}
     </div>
@@ -1896,12 +1914,17 @@ function renderAll() {
   const others=fil.filter(t=>t.type==='other');
 
   const aedDebits=debits.filter(t=>t.currency==='AED');
+  const reimbAed=aedDebits.filter(t=>getCategory(t)==='Reimbursable');
+  const aedDebitsExclReimb=aedDebits.filter(t=>getCategory(t)!=='Reimbursable');
   const aedCredits=credits.filter(t=>t.currency==='AED');
   const aedTransfers=transfers.filter(t=>t.currency==='AED');
-  const totalDebit=aedDebits.reduce((s,t)=>s+(t.amount||0),0);
+  const totalDebit=aedDebitsExclReimb.reduce((s,t)=>s+(t.amount||0),0);
   const totalCredit=aedCredits.reduce((s,t)=>s+(t.amount||0),0);
   const totalTransfer=aedTransfers.reduce((s,t)=>s+(t.amount||0),0);
   const totalDue=dues.filter(t=>t.currency==='AED'&&t.amount).reduce((s,t)=>s+(t.amount||0),0);
+  const totalReimb=reimbAed.reduce((s,t)=>s+(t.amount||0),0);
+  const totalReimbPending=reimbAed.filter(t=>(t.reimbStatus||'pending')!=='reimbursed').reduce((s,t)=>s+(t.amount||0),0);
+  const totalReimbDone=totalReimb-totalReimbPending;
 
   // Badges
   document.getElementById('bdg-spends').textContent=debits.length;
@@ -1929,10 +1952,11 @@ function renderAll() {
     </div>`:'';
 
   document.getElementById('stat-grid').innerHTML=
-    statCard('Total Spends (AED)',`AED ${fmtN(totalDebit)}`,`${debits.length} transactions`,'c-red')+
+    statCard('Total Spends (AED)',`AED ${fmtN(totalDebit)}`,`${debits.length-reimbAed.length} transactions`,'c-red')+
     statCard('Total Credits (AED)',`AED ${fmtN(totalCredit)}`,`${credits.length} transactions`,'c-green')+
     statCard('Transfers (AED)',`AED ${fmtN(totalTransfer)}`,`${transfers.length} transactions`,'c-blue')+
     statCard('Outstanding Dues',`AED ${fmtN(totalDue)}`,`${dues.length} notices`,'c-amber')+
+    (totalReimb>0?statCard('Reimbursable',`AED ${fmtN(totalReimbPending)}`,`pending · AED ${fmtN(totalReimbDone)} reimbursed`,'c-teal','switchTab(\'spends\');document.getElementById(\'cat-filter\').value=\'Reimbursable\';catFil=\'Reimbursable\';renderAll()'):'')+
     (uncatCount?statCard('Needs Review',`${uncatCount}`,`uncategorised merchants`,'c-orange','switchTab(\'spends\')'):'');
 
   renderCatChart(debits,'cat-chart');
@@ -1944,8 +1968,8 @@ function renderAll() {
 
   // ── SPENDS ──
   document.getElementById('spends-stats').innerHTML=
-    statCard('Total (AED)',`AED ${fmtN(totalDebit)}`,`${debits.length} txns`,'c-red')+
-    statCard('Avg per txn',aedDebits.length?`AED ${fmtN(totalDebit/aedDebits.length)}`:'—','average','c-amber')+
+    statCard('Total (AED)',`AED ${fmtN(totalDebit)}`,`${debits.length-reimbAed.length} txns`,'c-red')+
+    statCard('Avg per txn',aedDebitsExclReimb.length?`AED ${fmtN(totalDebit/aedDebitsExclReimb.length)}`:'—','average','c-amber')+
     statCard('Count',`${debits.length}`,`${aedDebits.length} AED · ${debits.length-aedDebits.length} INR`,'c-purple');
   renderCatChart(debits,'cat-chart2');
   renderMiniChart('chart-spends2','debit','c-red',fil);
@@ -2598,6 +2622,66 @@ function confirmDueAmount(fp, targetStatus) {
   if (partial) overrideStore[fp].flagReason='partial'; else delete overrideStore[fp].flagReason;
   if (targetStatus==='paid') overrideStore[fp].paidAmt=val;
   if (targetStatus==='acknowledged') overrideStore[fp].ackAmt=val;
+
+  saveAll(); closePanel(); allTxns=getAllTxns(); renderAll();
+}
+
+// ═══════════════════════════════════════════════════════════
+// REIMBURSEMENT STATUS — manual tracking, mirrors the Dues pattern above
+// ═══════════════════════════════════════════════════════════
+function advanceReimbStatus(fp) {
+  const t=allTxns.find(x=>x.fp===fp); if(!t) return;
+  const cur = t.reimbStatus||'pending';
+  if (cur==='pending') { openReimbAmountModal(fp); return; }
+  // currently reimbursed — tap again to reset back to pending
+  if (!confirm('Reset this spend back to Pending? This clears the recorded reimbursed amount.')) return;
+  if (!overrideStore[fp]) overrideStore[fp]={};
+  delete overrideStore[fp].reimbStatus;
+  delete overrideStore[fp].reimbAmt;
+  delete overrideStore[fp].reimbFlagReason;
+  saveAll(); allTxns=getAllTxns(); renderAll();
+}
+
+function openReimbAmountModal(fp) {
+  const t=allTxns.find(x=>x.fp===fp); if(!t) return;
+  const spendAmt = t.amount||0;
+  const prevAmt = overrideStore[fp]?.reimbAmt ?? spendAmt;
+
+  document.getElementById('panel-title').textContent = 'Mark as Reimbursed';
+  document.getElementById('panel-body').innerHTML = `
+    <div style="font-size:12px;color:var(--text2);margin-bottom:12px">
+      Spend amount: <b style="color:var(--text)">${fmtAmt(t)}</b>
+    </div>
+    <div class="mfield" style="margin-bottom:4px">
+      <label>Reimbursed amount</label>
+      <input type="number" id="reimb-amt-input" step="0.01" min="0" inputmode="decimal" value="${prevAmt||''}" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:14px;outline:none;width:100%">
+    </div>
+    <div id="reimb-amt-hint" style="font-size:11px;color:var(--text3);margin-top:4px"></div>`;
+
+  const ftr=document.querySelector('.panel-ftr');
+  ftr.innerHTML=`
+    <button class="btn-cancel" style="flex:1" onclick="closePanel()">Cancel</button>
+    <button class="btn-confirm" style="flex:1" onclick="confirmReimbAmount('${fp}')">Confirm</button>`;
+  document.getElementById('panel-overlay').classList.add('open');
+  setTimeout(()=>{ const el=document.getElementById('reimb-amt-input'); if(el){el.focus(); el.select();} }, 50);
+}
+
+function confirmReimbAmount(fp) {
+  const t=allTxns.find(x=>x.fp===fp); if(!t) return;
+  const input=document.getElementById('reimb-amt-input');
+  const val=parseFloat(input?.value);
+  if (isNaN(val) || val<0) {
+    const hint=document.getElementById('reimb-amt-hint');
+    if (hint) { hint.textContent='Enter a valid amount'; hint.style.color='var(--red)'; }
+    return;
+  }
+  const spendAmt=t.amount||0;
+  const partial = val < spendAmt-1;
+
+  if (!overrideStore[fp]) overrideStore[fp]={};
+  overrideStore[fp].reimbStatus='reimbursed';
+  overrideStore[fp].reimbAmt=val;
+  if (partial) overrideStore[fp].reimbFlagReason='partial'; else delete overrideStore[fp].reimbFlagReason;
 
   saveAll(); closePanel(); allTxns=getAllTxns(); renderAll();
 }
